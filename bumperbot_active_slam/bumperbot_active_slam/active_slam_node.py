@@ -10,6 +10,7 @@ import math
 from typing import Optional
 
 from action_msgs.msg import GoalStatus
+from geometry_msgs.msg import PointStamped
 from nav_msgs.msg import OccupancyGrid, Path
 from nav2_msgs.action import NavigateToPose
 import rclpy
@@ -21,6 +22,7 @@ from rclpy.time import Time
 from tf2_ros import Buffer, TransformException, TransformListener
 
 from bumperbot_active_slam.active_slam_types import CandidateGoal, ScoredFrontier
+from bumperbot_active_slam.aslam_core import compute_aslam_utility
 from bumperbot_active_slam.entropy_utils import (
     Cell,
     GridMeta,
@@ -37,6 +39,8 @@ from bumperbot_active_slam.entropy_utils import (
 from bumperbot_active_slam.exploration_state import ExplorationState
 from bumperbot_active_slam.frontier_detector import FrontierCluster, detect_frontier_clusters
 from bumperbot_active_slam.frontier_filter import (
+    FrontierPointFilter,
+    clusters_from_points,
     costmap_value_at,
     find_nearest_free_cell,
     information_gain,
@@ -45,6 +49,7 @@ from bumperbot_active_slam.frontier_filter import (
     path_has_occupied_cell,
 )
 from bumperbot_active_slam.marker_publisher import ActiveSlamMarkerPublisher
+from bumperbot_active_slam.rrt_frontier_detector import RrtFrontierDetector
 from bumperbot_active_slam.nav2_adapter import (
     Nav2ActionAdapter,
     goal_status_name,
@@ -103,6 +108,18 @@ class ActiveSlamExplorer(Node):
             marker_topic=self.marker_topic,
             debug_visited_goals=self.debug_visited_goals,
         )
+        self.rrt_detector = RrtFrontierDetector(
+            eta=self.rrt_eta,
+            samples_per_cycle=self.rrt_samples_per_cycle,
+            seed=self.rrt_random_seed if self.rrt_random_seed >= 0 else None,
+        )
+        self.frontier_filter = FrontierPointFilter(
+            timeout_sec=self.frontier_buffer_timeout_sec,
+            merge_radius=self.frontier_merge_radius,
+            min_cluster_size=1,
+        )
+        self.exploration_state_name = "COLLECTING_FRONTIERS"
+        self.frontier_collection_started = self.get_clock().now()
 
         self.create_ros_io()
         self.log_startup()
@@ -157,6 +174,27 @@ class ActiveSlamExplorer(Node):
         self.debug_markers = bool(self.declare_parameter("debug_markers", True).value)
         self.marker_topic = self.declare_parameter("marker_topic", "/active_slam/markers").value
         self.navigate_action_name = self.declare_parameter("navigate_action_name", "navigate_to_pose").value
+        default_frontier_source = "rrt" if self.algorithm_mode == "aslam_original" else "bfs"
+        self.frontier_source = str(self.declare_parameter("frontier_source", default_frontier_source).value)
+        if self.frontier_source not in ("rrt", "bfs"):
+            self.get_logger().warn(f"Unknown frontier_source '{self.frontier_source}', using '{default_frontier_source}'.")
+            self.frontier_source = default_frontier_source
+        self.rrt_eta = float(self.declare_parameter("rrt_eta", 0.5).value)
+        self.rrt_samples_per_cycle = int(self.declare_parameter("rrt_samples_per_cycle", 80).value)
+        self.rrt_include_global = bool(self.declare_parameter("rrt_include_global", True).value)
+        self.rrt_include_local = bool(self.declare_parameter("rrt_include_local", True).value)
+        self.rrt_random_seed = int(self.declare_parameter("rrt_random_seed", -1).value)
+        self.publish_detected_points = bool(self.declare_parameter("publish_detected_points", True).value)
+        self.detected_points_topic = self.declare_parameter("detected_points_topic", "/active_slam/detected_points").value
+        self.filtered_points_topic = self.declare_parameter("filtered_points_topic", "/active_slam/filtered_points").value
+        self.frontier_collection_time_sec = float(self.declare_parameter("frontier_collection_time_sec", 3.0).value)
+        self.min_raw_frontiers_before_planning = int(self.declare_parameter("min_raw_frontiers_before_planning", 5).value)
+        self.max_goal_search_time_sec = float(self.declare_parameter("max_goal_search_time_sec", 15.0).value)
+        self.frontier_merge_radius = float(self.declare_parameter("frontier_merge_radius", 0.35).value)
+        self.frontier_buffer_timeout_sec = float(self.declare_parameter("frontier_buffer_timeout_sec", 20.0).value)
+
+        if self.algorithm_mode == "aslam_original" and self.frontier_source != "rrt":
+            self.get_logger().warn("aslam_original requested with non-RRT frontier_source; this is a debug fallback, not the original detector.")
 
         if self.decision_rate_hz <= 0.0:
             self.get_logger().warn("decision_rate_hz must be positive; using 0.2 Hz")
@@ -189,6 +227,11 @@ class ActiveSlamExplorer(Node):
             costmap_qos,
             callback_group=self.callback_group,
         )
+        self.detected_points_pub = None
+        self.filtered_points_pub = None
+        if self.publish_detected_points:
+            self.detected_points_pub = self.create_publisher(PointStamped, self.detected_points_topic, 10)
+            self.filtered_points_pub = self.create_publisher(PointStamped, self.filtered_points_topic, 10)
         self.timer = self.create_timer(1.0 / self.decision_rate_hz, self.decision_callback, callback_group=self.callback_group)
 
     def log_startup(self) -> None:
@@ -200,7 +243,7 @@ class ActiveSlamExplorer(Node):
         if self.algorithm_mode == "aslam_original":
             self.get_logger().info(
                 "aslam_original mode: costmap/information-gain/planner filters follow aslam_rosbot; "
-                "the current BFS frontier detector is a ROS 2 substitute for the original RRT detectors."
+                f"frontier_source={self.frontier_source}; BFS is only a fallback/debug source."
             )
 
     def map_callback(self, msg: OccupancyGrid) -> None:
@@ -221,23 +264,34 @@ class ActiveSlamExplorer(Node):
         now = self.get_clock().now()
         self.update_navigation_state(robot_xy)
         self.state.prune(now)
+        self.last_rejection_counts = {}
 
         map_msg = self.latest_map
         meta = grid_meta_from_map_info(map_msg.info)
-        raw_clusters = self.detect_raw_clusters(map_msg, meta)
+        raw_clusters, candidate_clusters = self.collect_frontier_candidates(map_msg, meta, robot_xy, now)
 
         if self.is_navigating():
+            self.exploration_state_name = "NAVIGATING"
             self.navigation_status = "NAVIGATING"
             self.publish_markers(raw_clusters, [], None, meta)
             return
 
         if self.state.is_settling(now):
+            self.exploration_state_name = "SETTLING"
             self.navigation_status = "SETTLING"
             self.publish_markers(raw_clusters, [], None, meta)
             return
 
-        scored_frontiers = self.score_frontiers(map_msg, meta, robot_xy, raw_clusters)
+        if self.should_keep_collecting(now, len(raw_clusters)):
+            self.exploration_state_name = "COLLECTING_FRONTIERS"
+            self.navigation_status = "COLLECTING_FRONTIERS"
+            self.publish_markers(raw_clusters, [], None, meta)
+            return
+
+        self.exploration_state_name = "PLANNING_GOAL"
+        scored_frontiers = self.score_frontiers(map_msg, meta, robot_xy, candidate_clusters)
         if not scored_frontiers:
+            self.exploration_state_name = "NO_VALID_FRONTIER"
             self.navigation_status = "NO_VALID_FRONTIER"
             self.log_no_valid_frontiers(len(raw_clusters), len(scored_frontiers))
             self.publish_markers(raw_clusters, [], None, meta)
@@ -262,7 +316,55 @@ class ActiveSlamExplorer(Node):
         translation = transform.transform.translation
         return float(translation.x), float(translation.y)
 
-    def detect_raw_clusters(self, map_msg: OccupancyGrid, meta: GridMeta) -> list[FrontierCluster]:
+    def collect_frontier_candidates(
+        self,
+        map_msg: OccupancyGrid,
+        meta: GridMeta,
+        robot_xy: Point2D,
+        now: Time,
+    ) -> tuple[list[FrontierCluster], list[FrontierCluster]]:
+        if self.frontier_source == "rrt":
+            return self.collect_rrt_frontiers(map_msg, meta, robot_xy, now)
+        clusters = self.detect_bfs_clusters(map_msg, meta)
+        self.publish_point_stream(clusters, filtered_clusters=clusters)
+        return clusters, clusters
+
+    def collect_rrt_frontiers(
+        self,
+        map_msg: OccupancyGrid,
+        meta: GridMeta,
+        robot_xy: Point2D,
+        now: Time,
+    ) -> tuple[list[FrontierCluster], list[FrontierCluster]]:
+        raw_points = self.rrt_detector.detect(
+            map_msg.data,
+            meta,
+            robot_xy,
+            include_global=self.rrt_include_global,
+            include_local=self.rrt_include_local,
+        )
+        now_sec = now.nanoseconds / 1.0e9
+        self.frontier_filter.add_points(raw_points, now_sec)
+        buffered_raw_points = self.frontier_filter.raw_points(now_sec)
+        filtered_points, rejected = self.frontier_filter.filtered_points(
+            now_sec,
+            map_msg,
+            meta,
+            self.latest_costmap,
+            self.global_frame,
+            costmap_threshold=self.costmap_clearing_threshold,
+            allow_unknown_goal=self.allow_unknown_goal,
+            info_radius=self.info_radius,
+            information_threshold=self.information_threshold,
+        )
+        for key, value in rejected.items():
+            self.last_rejection_counts[key] = self.last_rejection_counts.get(key, 0) + value
+        raw_clusters = clusters_from_points(buffered_raw_points, meta)
+        filtered_clusters = clusters_from_points(filtered_points, meta)
+        self.publish_point_stream(raw_clusters, filtered_clusters=filtered_clusters)
+        return raw_clusters, filtered_clusters
+
+    def detect_bfs_clusters(self, map_msg: OccupancyGrid, meta: GridMeta) -> list[FrontierCluster]:
         return detect_frontier_clusters(
             map_msg.data,
             width=meta.width,
@@ -273,6 +375,47 @@ class ActiveSlamExplorer(Node):
             min_cluster_size=self.frontier_min_cluster_size,
             connectivity=self.frontier_connectivity,
         )
+
+    def should_keep_collecting(self, now: Time, raw_count: int) -> bool:
+        if self.frontier_source != "rrt" or self.algorithm_mode != "aslam_original":
+            return False
+        elapsed = (now - self.frontier_collection_started).nanoseconds / 1.0e9
+        if raw_count >= self.min_raw_frontiers_before_planning and elapsed >= self.frontier_collection_time_sec:
+            return False
+        if elapsed >= self.max_goal_search_time_sec:
+            return False
+        self.log_throttled(
+            "collecting_frontiers",
+            f"Collecting RRT frontiers: raw={raw_count}, elapsed={elapsed:.1f}s",
+            level="info",
+            period_sec=2.0,
+        )
+        return True
+
+    def publish_point_stream(
+        self,
+        raw_clusters: list[FrontierCluster],
+        *,
+        filtered_clusters: list[FrontierCluster],
+    ) -> None:
+        if not self.publish_detected_points:
+            return
+        now_msg = self.get_clock().now().to_msg()
+        for cluster in raw_clusters:
+            if self.detected_points_pub is not None:
+                self.detected_points_pub.publish(self.make_point_stamped(cluster.centroid, now_msg))
+        for cluster in filtered_clusters:
+            if self.filtered_points_pub is not None:
+                self.filtered_points_pub.publish(self.make_point_stamped(cluster.centroid, now_msg))
+
+    def make_point_stamped(self, xy: Point2D, stamp) -> PointStamped:
+        msg = PointStamped()
+        msg.header.frame_id = self.global_frame
+        msg.header.stamp = stamp
+        msg.point.x = xy[0]
+        msg.point.y = xy[1]
+        msg.point.z = 0.0
+        return msg
 
     def score_frontiers(
         self,
@@ -286,7 +429,6 @@ class ActiveSlamExplorer(Node):
             self.log_throttled("robot_off_map", "Robot pose is outside the occupancy grid.", level="warn")
             return []
 
-        self.last_rejection_counts = {}
         scored: list[ScoredFrontier] = []
         for cluster in clusters:
             frontier_xy = cluster.centroid
@@ -330,16 +472,41 @@ class ActiveSlamExplorer(Node):
                 self.reject_candidate("goal_too_close")
                 continue
 
-            path_cells = bresenham(robot_cell, frontier_cell)
-            occupancy_values = path_occupancy_values(map_msg.data, path_cells, meta)
-            _, normalized_entropy = compute_path_entropy(
-                occupancy_values,
-                unknown_probability=self.unknown_probability,
-                known_probability=self.known_probability,
-            )
-            entropy_reward = clamp(1.0 - normalized_entropy, 0.0, 1.0)
-            gamma = distance_decay(distance, self.lambda_decay)
-            utility = (self.w_entropy * entropy_reward) + (self.w_distance * gamma)
+            if self.algorithm_mode == "aslam_original":
+                aslam_utility = compute_aslam_utility(
+                    map_msg.data,
+                    meta,
+                    robot_xy,
+                    frontier_xy,
+                    nav_goal.planner_path.poses,
+                    info_radius=self.info_radius,
+                    lambda_decay=self.lambda_decay,
+                    unknown_probability=self.unknown_probability,
+                    known_probability=self.known_probability,
+                )
+                path_cells = aslam_utility.path_cells
+                entropy_reward = aslam_utility.inv_entropy
+                gamma = aslam_utility.gamma
+                utility = aslam_utility.utility
+                spann = aslam_utility.spann
+                eta = aslam_utility.eta
+                entropy_value = aslam_utility.entropy
+                pose_graph_fallback = aslam_utility.pose_graph_fallback
+            else:
+                path_cells = bresenham(robot_cell, frontier_cell)
+                occupancy_values = path_occupancy_values(map_msg.data, path_cells, meta)
+                _, normalized_entropy = compute_path_entropy(
+                    occupancy_values,
+                    unknown_probability=self.unknown_probability,
+                    known_probability=self.known_probability,
+                )
+                entropy_reward = clamp(1.0 - normalized_entropy, 0.0, 1.0)
+                gamma = distance_decay(distance, self.lambda_decay)
+                utility = (self.w_entropy * entropy_reward) + (self.w_distance * gamma)
+                spann = 0.0
+                eta = 1.0
+                entropy_value = normalized_entropy
+                pose_graph_fallback = False
 
             scored.append(
                 ScoredFrontier(
@@ -358,6 +525,12 @@ class ActiveSlamExplorer(Node):
                     information_gain=info_gain,
                     costmap_cost=nav_goal.costmap_cost,
                     used_offset_goal=nav_goal.used_offset,
+                    spann=spann,
+                    inv_entropy=entropy_reward,
+                    eta=eta,
+                    gamma=gamma,
+                    entropy=entropy_value,
+                    pose_graph_fallback=pose_graph_fallback,
                 )
             )
         return scored
@@ -567,8 +740,10 @@ class ActiveSlamExplorer(Node):
         self.get_logger().info(
             f"Sending NavigateToPose goal to ({selected.nav_goal_xy[0]:.2f}, {selected.nav_goal_xy[1]:.2f}) "
             f"for frontier ({selected.cluster.centroid[0]:.2f}, {selected.cluster.centroid[1]:.2f}), "
-            f"utility={selected.utility:.3f}, info_gain={selected.information_gain:.2f}, "
-            f"cost={selected.costmap_cost}, plan={selected.planner_path_length:.2f} m"
+            f"utility={selected.utility:.3f}, spann={selected.spann:.3f}, "
+            f"inv_entropy={selected.inv_entropy:.3f}, eta={selected.eta:.3f}, gamma={selected.gamma:.3f}, "
+            f"info_gain={selected.information_gain:.2f}, cost={selected.costmap_cost}, "
+            f"plan={selected.planner_path_length:.2f} m"
         )
         send_future = self.nav2.send_navigation_goal(goal_msg, feedback_callback=self.navigation_feedback_callback)
         send_future.add_done_callback(lambda future, scored=selected: self.navigation_goal_response_callback(future, scored))
@@ -604,6 +779,7 @@ class ActiveSlamExplorer(Node):
         if status == GoalStatus.STATUS_SUCCEEDED:
             self.navigation_status = "SETTLING"
             self.state.start_settling(now)
+            self.frontier_collection_started = now
             self.state.add_to_visited(now, selected.nav_goal_xy)
             self.state.add_to_visited(now, selected.cluster.centroid)
             self.get_logger().info(
@@ -665,8 +841,9 @@ class ActiveSlamExplorer(Node):
             self.get_logger().info(
                 "Selected frontier at "
                 f"({selected.cluster.centroid[0]:.2f}, {selected.cluster.centroid[1]:.2f}), "
-                f"utility={selected.utility:.3f}, entropy_reward={selected.entropy_reward:.3f}, "
-                f"distance_reward={selected.distance_reward:.3f}, distance={selected.distance:.2f} m, "
+                f"utility={selected.utility:.3f}, spann={selected.spann:.3f}, "
+                f"inv_entropy={selected.inv_entropy:.3f}, eta={selected.eta:.3f}, "
+                f"gamma={selected.gamma:.3f}, distance={selected.distance:.2f} m, "
                 f"info_gain={selected.information_gain:.2f}, cost={selected.costmap_cost}, "
                 f"planner_path={selected.planner_path_length:.2f} m"
             )

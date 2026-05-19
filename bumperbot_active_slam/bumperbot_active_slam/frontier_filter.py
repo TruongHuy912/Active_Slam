@@ -146,3 +146,121 @@ def find_nearest_free_cell(
         if best_cell is not None:
             return best_cell
     return None
+
+
+class FrontierPointFilter:
+    """filter.py-style raw frontier buffer, clustering, and filtering.
+
+    Ported from aslam_rosbot/scripts/filter.py::frontiersCallBack() and
+    aslam_rosbot/scripts/filter.py::node(). The original used
+    sklearn.cluster.MeanShift(bandwidth=1.5). To avoid adding a runtime
+    dependency, this class uses a deterministic radius-merge approximation with
+    the same bandwidth parameter.
+    """
+
+    def __init__(
+        self,
+        *,
+        timeout_sec: float = 2.0,
+        merge_radius: float = 1.5,
+        min_cluster_size: int = 1,
+    ) -> None:
+        self.timeout_sec = timeout_sec
+        self.merge_radius = merge_radius
+        self.min_cluster_size = max(1, min_cluster_size)
+        self._points: list[tuple[Point2D, float]] = []
+
+    def add_points(self, points: Sequence[Point2D], stamp_sec: float) -> None:
+        """Store raw frontiers and refresh duplicate timestamps."""
+
+        for point in points:
+            self._upsert((float(point[0]), float(point[1])), stamp_sec)
+
+    def prune(self, now_sec: float) -> None:
+        self._points = [entry for entry in self._points if abs(now_sec - entry[1]) <= self.timeout_sec]
+
+    def raw_points(self, now_sec: float) -> list[Point2D]:
+        self.prune(now_sec)
+        return [point for point, _stamp in self._points]
+
+    def clustered_points(self, now_sec: float) -> list[Point2D]:
+        """Return MeanShift-like centroids for buffered raw frontiers."""
+
+        points = self.raw_points(now_sec)
+        if len(points) <= 1:
+            return points
+
+        remaining = set(range(len(points)))
+        centroids: list[Point2D] = []
+        while remaining:
+            seed = min(remaining)
+            queue = [seed]
+            remaining.remove(seed)
+            members: list[int] = []
+            while queue:
+                idx = queue.pop()
+                members.append(idx)
+                px, py = points[idx]
+                close = [
+                    other for other in list(remaining)
+                    if math.hypot(points[other][0] - px, points[other][1] - py) <= self.merge_radius
+                ]
+                for other in close:
+                    remaining.remove(other)
+                    queue.append(other)
+            if len(members) >= self.min_cluster_size:
+                count = float(len(members))
+                centroids.append((
+                    sum(points[idx][0] for idx in members) / count,
+                    sum(points[idx][1] for idx in members) / count,
+                ))
+        return centroids
+
+    def filtered_points(
+        self,
+        now_sec: float,
+        map_msg: OccupancyGrid,
+        meta: GridMeta,
+        costmap: Optional[OccupancyGrid],
+        global_frame: str,
+        *,
+        costmap_threshold: int = 70,
+        allow_unknown_goal: bool = False,
+        info_radius: float = 1.0,
+        information_threshold: float = 0.45,
+    ) -> tuple[list[Point2D], dict[str, int]]:
+        """Apply filter.py costmap and information-gain rejection logic."""
+
+        accepted: list[Point2D] = []
+        rejected: dict[str, int] = {}
+        for point in self.clustered_points(now_sec):
+            cost, reason = costmap_value_at(costmap, global_frame, point)
+            if cost is None or not is_acceptable_cost(cost, costmap_threshold, allow_unknown_goal):
+                rejected[reason or "costmap_rejected"] = rejected.get(reason or "costmap_rejected", 0) + 1
+                continue
+            gain = information_gain(map_msg, meta, point, info_radius)
+            if gain < information_threshold:
+                rejected["low_information_gain"] = rejected.get("low_information_gain", 0) + 1
+                continue
+            accepted.append(point)
+        return accepted, rejected
+
+    def _upsert(self, point: Point2D, stamp_sec: float) -> None:
+        for index, (stored, _stamp) in enumerate(self._points):
+            if math.hypot(stored[0] - point[0], stored[1] - point[1]) <= 1.0e-9:
+                self._points[index] = (stored, stamp_sec)
+                return
+        self._points.append((point, stamp_sec))
+
+
+def clusters_from_points(points: Sequence[Point2D], meta: GridMeta) -> list[object]:
+    """Build FrontierCluster objects from centroid points without ROS imports."""
+
+    from bumperbot_active_slam.frontier_detector import FrontierCluster
+
+    clusters = []
+    for point in points:
+        cell = world_to_map(point[0], point[1], meta)
+        cells = tuple([cell]) if cell is not None else tuple()
+        clusters.append(FrontierCluster(cells=cells, centroid=(float(point[0]), float(point[1]))))
+    return clusters

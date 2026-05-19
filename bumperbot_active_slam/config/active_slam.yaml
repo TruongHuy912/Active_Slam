@@ -6,6 +6,20 @@ active_slam_explorer:
     robot_frame: "base_link"
     marker_topic: "/active_slam/markers"
     algorithm_mode: "aslam_original"
+    frontier_source: "rrt"
+    rrt_eta: 0.5
+    rrt_samples_per_cycle: 80
+    rrt_include_global: true
+    rrt_include_local: true
+    rrt_random_seed: -1
+    publish_detected_points: true
+    detected_points_topic: "/active_slam/detected_points"
+    filtered_points_topic: "/active_slam/filtered_points"
+    frontier_collection_time_sec: 3.0
+    min_raw_frontiers_before_planning: 5
+    max_goal_search_time_sec: 15.0
+    frontier_merge_radius: 0.35
+    frontier_buffer_timeout_sec: 20.0
     frontier_min_cluster_size: 5
     frontier_connectivity: 8
     lambda_decay: 0.6

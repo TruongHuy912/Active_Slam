@@ -44,6 +44,12 @@ class ScoredFrontier:
     information_gain: float
     costmap_cost: int
     used_offset_goal: bool
+    spann: float = 0.0
+    inv_entropy: float = 0.0
+    eta: float = 1.0
+    gamma: float = 0.0
+    entropy: float = 0.0
+    pose_graph_fallback: bool = False
 
 
 @dataclass

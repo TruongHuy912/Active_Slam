@@ -241,8 +241,9 @@ class ActiveSlamMarkerPublisher:
         marker.color.b = 1.0
         marker.color.a = 1.0
         marker.text = (
-            f"U={selected.utility:.3f} IG={selected.information_gain:.2f}\n"
-            f"cost={selected.costmap_cost} plan={selected.planner_path_length:.2f}m\n"
+            f"U={selected.utility:.3f} spann={selected.spann:.3f}\n"
+            f"invH={selected.inv_entropy:.3f} eta={selected.eta:.3f} gamma={selected.gamma:.3f}\n"
+            f"IG={selected.information_gain:.2f} cost={selected.costmap_cost} plan={selected.planner_path_length:.2f}m\n"
             f"goal=({selected.nav_goal_xy[0]:.2f},{selected.nav_goal_xy[1]:.2f}) "
             f"{'offset' if selected.used_offset_goal else 'centroid'}"
         )
