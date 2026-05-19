@@ -60,5 +60,6 @@ active_slam_explorer:
     rejected_blacklist_timeout_sec: 5.0
     max_goal_retries: 2
     keep_selecting_markers_while_navigating: true
+    show_preview_while_navigating: false
     debug_markers: true
     navigate_action_name: "navigate_to_pose"
