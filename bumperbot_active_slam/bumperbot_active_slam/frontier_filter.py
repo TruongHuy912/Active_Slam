@@ -183,38 +183,35 @@ class FrontierPointFilter:
         self.prune(now_sec)
         return [point for point, _stamp in self._points]
 
-    def clustered_points(self, now_sec: float) -> list[Point2D]:
-        """Return MeanShift-like centroids for buffered raw frontiers."""
+    def clustered_points(
+        self,
+        now_sec: float,
+        *,
+        mode: str = "radius_merge",
+        meanshift_bandwidth: float = 1.5,
+        meanshift_max_iterations: int = 20,
+        meanshift_tolerance: float = 0.05,
+        meanshift_min_cluster_size: int = 1,
+    ) -> list[Point2D]:
+        """Return clustered centroids for buffered raw frontiers.
+
+        ``radius_merge`` preserves the stable ROS 2 baseline.
+        ``mean_shift_like`` is a lightweight, dependency-free approximation of
+        aslam_rosbot/scripts/filter.py MeanShift(bandwidth=1.5).
+        """
 
         points = self.raw_points(now_sec)
         if len(points) <= 1:
             return points
-
-        remaining = set(range(len(points)))
-        centroids: list[Point2D] = []
-        while remaining:
-            seed = min(remaining)
-            queue = [seed]
-            remaining.remove(seed)
-            members: list[int] = []
-            while queue:
-                idx = queue.pop()
-                members.append(idx)
-                px, py = points[idx]
-                close = [
-                    other for other in list(remaining)
-                    if math.hypot(points[other][0] - px, points[other][1] - py) <= self.merge_radius
-                ]
-                for other in close:
-                    remaining.remove(other)
-                    queue.append(other)
-            if len(members) >= self.min_cluster_size:
-                count = float(len(members))
-                centroids.append((
-                    sum(points[idx][0] for idx in members) / count,
-                    sum(points[idx][1] for idx in members) / count,
-                ))
-        return centroids
+        if mode == "mean_shift_like":
+            return mean_shift_like_points(
+                points,
+                bandwidth=meanshift_bandwidth,
+                max_iterations=meanshift_max_iterations,
+                tolerance=meanshift_tolerance,
+                min_cluster_size=meanshift_min_cluster_size,
+            )
+        return radius_merge_points(points, self.merge_radius, self.min_cluster_size)
 
     def filtered_points(
         self,
@@ -251,6 +248,94 @@ class FrontierPointFilter:
                 self._points[index] = (stored, stamp_sec)
                 return
         self._points.append((point, stamp_sec))
+
+
+def radius_merge_points(points: Sequence[Point2D], merge_radius: float, min_cluster_size: int = 1) -> list[Point2D]:
+    """Stable radius-merge clustering used by the ROS 2 baseline."""
+
+    if len(points) <= 1:
+        return list(points)
+    remaining = set(range(len(points)))
+    centroids: list[Point2D] = []
+    while remaining:
+        seed = min(remaining)
+        queue = [seed]
+        remaining.remove(seed)
+        members: list[int] = []
+        while queue:
+            idx = queue.pop()
+            members.append(idx)
+            px, py = points[idx]
+            close = [
+                other for other in list(remaining)
+                if math.hypot(points[other][0] - px, points[other][1] - py) <= merge_radius
+            ]
+            for other in close:
+                remaining.remove(other)
+                queue.append(other)
+        if len(members) >= max(1, min_cluster_size):
+            centroids.append(mean_point([points[idx] for idx in members]))
+    return centroids
+
+
+def mean_shift_like_points(
+    points: Sequence[Point2D],
+    *,
+    bandwidth: float = 1.5,
+    max_iterations: int = 20,
+    tolerance: float = 0.05,
+    min_cluster_size: int = 1,
+) -> list[Point2D]:
+    """Dependency-free approximation of filter.py MeanShift(bandwidth=1.5)."""
+
+    if len(points) <= 1:
+        return list(points)
+    radius = max(1.0e-6, float(bandwidth))
+    shifted: list[Point2D] = []
+    for point in points:
+        center = (float(point[0]), float(point[1]))
+        for _ in range(max(1, int(max_iterations))):
+            neighbors = [candidate for candidate in points if point_distance(center, candidate) <= radius]
+            if not neighbors:
+                break
+            new_center = mean_point(neighbors)
+            if point_distance(center, new_center) <= max(0.0, float(tolerance)):
+                center = new_center
+                break
+            center = new_center
+        shifted.append(center)
+
+    centers: list[tuple[Point2D, int]] = []
+    merge_distance = max(max(0.0, float(tolerance)), radius * 0.5)
+    for center in shifted:
+        for index, (existing, count) in enumerate(centers):
+            if point_distance(center, existing) <= merge_distance:
+                total = float(count + 1)
+                merged = (
+                    (existing[0] * count + center[0]) / total,
+                    (existing[1] * count + center[1]) / total,
+                )
+                centers[index] = (merged, count + 1)
+                break
+        else:
+            centers.append((center, 1))
+
+    min_size = max(1, int(min_cluster_size))
+    return [center for center, count in centers if count >= min_size]
+
+
+def mean_point(points: Sequence[Point2D]) -> Point2D:
+    count = float(len(points))
+    if count <= 0.0:
+        raise ValueError("Cannot compute mean of an empty point set")
+    return (
+        sum(point[0] for point in points) / count,
+        sum(point[1] for point in points) / count,
+    )
+
+
+def point_distance(a: Point2D, b: Point2D) -> float:
+    return math.hypot(a[0] - b[0], a[1] - b[1])
 
 
 def clusters_from_points(points: Sequence[Point2D], meta: GridMeta) -> list[object]:

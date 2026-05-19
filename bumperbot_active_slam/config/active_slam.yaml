@@ -18,12 +18,29 @@ active_slam_explorer:
     frontier_collection_time_sec: 3.0
     min_raw_frontiers_before_planning: 5
     max_goal_search_time_sec: 15.0
-    frontier_merge_radius: 0.35
-    frontier_buffer_timeout_sec: 20.0
-    enable_nav2_goal_fallback: true
-    nav2_goal_search_radius: 0.6
+    frontier_clustering_mode: "mean_shift_like"
+    frontier_merge_radius: 0.5
+    frontier_meanshift_bandwidth: 1.0
+    frontier_meanshift_max_iterations: 20
+    frontier_meanshift_tolerance: 0.05
+    frontier_meanshift_min_cluster_size: 1
+    frontier_meanshift_warn_if_clusters_less_than: 3
+    frontier_buffer_timeout_sec: 2.0
+    enable_nav2_goal_fallback: false
+    nav2_goal_search_radius: 0.8
     nav2_goal_search_step: 0.10
-    nav2_goal_max_cost: 50
+    nav2_goal_max_cost: 30
+    nav2_goal_min_clearance: 0.35
+    nav2_goal_clearance_check_radius: 0.45
+    nav2_path_max_cost: 50
+    nav2_path_clearance_radius: 0.25
+    debug_safe_goal_search: true
+    enable_frontier_suppression: true
+    frontier_suppression_radius: 0.6
+    frontier_suppression_timeout_sec: 30.0
+    frontier_suppression_max_failures: 2
+    frontier_suppression_max_regions: 50
+    enable_frontier_viewpoint_goal: false
     frontier_min_cluster_size: 5
     frontier_connectivity: 8
     lambda_decay: 0.6
@@ -36,9 +53,11 @@ active_slam_explorer:
     decision_rate_hz: 0.2
     goal_reached_distance: 0.3
     goal_timeout_sec: 180.0
-    frontier_goal_offset: 0.0
+    frontier_goal_offset: 0.45
     goal_search_radius_cells: 8
     costmap_clearing_threshold: 70
+    frontier_costmap_threshold: 85
+    nav_goal_costmap_threshold: 70
     allow_unknown_goal: false
     info_radius: 1.0
     information_threshold: 0.45

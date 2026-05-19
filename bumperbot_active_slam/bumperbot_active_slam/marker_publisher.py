@@ -31,6 +31,7 @@ class ActiveSlamMarkerPublisher:
         rejected_costmap_clusters: list[FrontierCluster] | None = None,
         current_navigation: ScoredFrontier | None = None,
         preview_selected: ScoredFrontier | None = None,
+        safe_goal_candidate_clusters: list[FrontierCluster] | None = None,
     ) -> None:
         markers = MarkerArray()
         markers.markers.append(self.make_delete_all_marker())
@@ -44,6 +45,18 @@ class ActiveSlamMarkerPublisher:
                 cluster.centroid,
                 scale=0.08,
                 color=(1.0, 0.85, 0.0, 0.55),
+            )
+            marker.header.stamp = now
+            markers.markers.append(marker)
+            marker_id += 1
+
+        for safe_candidate in safe_goal_candidate_clusters or []:
+            marker = self.make_cube_marker(
+                marker_id,
+                "safe_goal_candidates",
+                safe_candidate.centroid,
+                scale=0.08,
+                color=(0.0, 0.9, 1.0, 0.35),
             )
             marker.header.stamp = now
             markers.markers.append(marker)
@@ -120,6 +133,19 @@ class ActiveSlamMarkerPublisher:
             markers.markers.append(current_goal)
             marker_id += 1
 
+            if current_navigation.used_offset_goal:
+                link_marker = self.make_point_link_marker(
+                    marker_id,
+                    "current_safe_goal_link",
+                    current_navigation.cluster.centroid,
+                    current_navigation.nav_goal_xy,
+                    color=(0.0, 1.0, 0.95, 1.0),
+                    scale=0.055,
+                )
+                link_marker.header.stamp = now
+                markers.markers.append(link_marker)
+                marker_id += 1
+
         if preview_selected is not None:
             preview_goal = self.make_cube_marker(
                 marker_id,
@@ -182,6 +208,19 @@ class ActiveSlamMarkerPublisher:
             goal_marker.header.stamp = now
             markers.markers.append(goal_marker)
             marker_id += 1
+
+            if selected.used_offset_goal:
+                link_marker = self.make_point_link_marker(
+                    marker_id,
+                    "safe_goal_link",
+                    selected.cluster.centroid,
+                    selected.nav_goal_xy,
+                    color=(0.0, 1.0, 0.95, 1.0),
+                    scale=0.045,
+                )
+                link_marker.header.stamp = now
+                markers.markers.append(link_marker)
+                marker_id += 1
 
             text_marker = self.make_text_marker(marker_id, selected)
             text_marker.header.stamp = now
@@ -272,6 +311,36 @@ class ActiveSlamMarkerPublisher:
             point.x = x
             point.y = y
             point.z = 0.04
+            marker.points.append(point)
+        return marker
+
+    def make_point_link_marker(
+        self,
+        marker_id: int,
+        namespace: str,
+        start_xy: Point2D,
+        end_xy: Point2D,
+        *,
+        color: tuple[float, float, float, float],
+        scale: float,
+    ) -> Marker:
+        marker = Marker()
+        marker.header.frame_id = self.global_frame
+        marker.ns = namespace
+        marker.id = marker_id
+        marker.type = Marker.LINE_STRIP
+        marker.action = Marker.ADD
+        marker.pose.orientation.w = 1.0
+        marker.scale.x = scale
+        marker.color.r = color[0]
+        marker.color.g = color[1]
+        marker.color.b = color[2]
+        marker.color.a = color[3]
+        for xy, z in ((start_xy, 0.12), (end_xy, 0.12)):
+            point = Point()
+            point.x = xy[0]
+            point.y = xy[1]
+            point.z = z
             marker.points.append(point)
         return marker
 

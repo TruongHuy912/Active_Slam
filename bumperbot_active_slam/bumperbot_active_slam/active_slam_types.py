@@ -23,6 +23,9 @@ class CandidateGoal:
     planner_path_length: float
     costmap_cost: int
     used_offset: bool
+    min_goal_clearance: float = 0.0
+    path_max_cost: int = 0
+    path_min_clearance: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -50,6 +53,23 @@ class ScoredFrontier:
     gamma: float = 0.0
     entropy: float = 0.0
     pose_graph_fallback: bool = False
+    min_goal_clearance: float = 0.0
+    path_max_cost: int = 0
+    path_min_clearance: float = 0.0
+
+
+@dataclass(frozen=True)
+class GoalValidationResult:
+    """Structured result for a rejected navigation goal validation step."""
+
+    ok: bool
+    stage: str
+    reason: str
+    cost: Optional[int] = None
+    threshold: Optional[int] = None
+    goal_clearance: Optional[float] = None
+    path_min_clearance: Optional[float] = None
+    path_max_cost: Optional[int] = None
 
 
 @dataclass
