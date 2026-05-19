@@ -28,6 +28,9 @@ class ActiveSlamMarkerPublisher:
         visited_goals: list[VisitedGoal],
         active_goal_xy: Point2D | None,
         navigation_status: str,
+        rejected_costmap_clusters: list[FrontierCluster] | None = None,
+        current_navigation: ScoredFrontier | None = None,
+        preview_selected: ScoredFrontier | None = None,
     ) -> None:
         markers = MarkerArray()
         markers.markers.append(self.make_delete_all_marker())
@@ -41,6 +44,18 @@ class ActiveSlamMarkerPublisher:
                 cluster.centroid,
                 scale=0.08,
                 color=(1.0, 0.85, 0.0, 0.55),
+            )
+            marker.header.stamp = now
+            markers.markers.append(marker)
+            marker_id += 1
+
+        for rejected in rejected_costmap_clusters or []:
+            marker = self.make_cube_marker(
+                marker_id,
+                "rejected_costmap_frontiers",
+                rejected.centroid,
+                scale=0.12,
+                color=(1.0, 0.25, 0.2, 0.45),
             )
             marker.header.stamp = now
             markers.markers.append(marker)
@@ -71,7 +86,64 @@ class ActiveSlamMarkerPublisher:
                 markers.markers.append(marker)
                 marker_id += 1
 
-        if selected is not None:
+        if current_navigation is not None:
+            current_frontier = self.make_cube_marker(
+                marker_id,
+                "current_selected_frontier",
+                current_navigation.cluster.centroid,
+                scale=0.34,
+                color=(1.0, 0.35, 0.0, 1.0),
+            )
+            current_frontier.header.stamp = now
+            markers.markers.append(current_frontier)
+            marker_id += 1
+
+            current_path = self.make_planner_path_marker(
+                marker_id,
+                current_navigation.planner_path,
+                namespace="current_navigation_path",
+                color=(1.0, 0.55, 0.0, 1.0),
+                scale=0.075,
+            )
+            current_path.header.stamp = now
+            markers.markers.append(current_path)
+            marker_id += 1
+
+            current_goal = self.make_cube_marker(
+                marker_id,
+                "current_navigation_goal",
+                current_navigation.nav_goal_xy,
+                scale=0.26,
+                color=(0.0, 1.0, 0.2, 1.0),
+            )
+            current_goal.header.stamp = now
+            markers.markers.append(current_goal)
+            marker_id += 1
+
+        if preview_selected is not None:
+            preview_goal = self.make_cube_marker(
+                marker_id,
+                "preview_candidate_goal",
+                preview_selected.nav_goal_xy,
+                scale=0.18,
+                color=(0.1, 0.65, 1.0, 0.75),
+            )
+            preview_goal.header.stamp = now
+            markers.markers.append(preview_goal)
+            marker_id += 1
+
+            preview_path = self.make_planner_path_marker(
+                marker_id,
+                preview_selected.planner_path,
+                namespace="preview_candidate_path",
+                color=(0.1, 0.65, 1.0, 0.75),
+                scale=0.035,
+            )
+            preview_path.header.stamp = now
+            markers.markers.append(preview_path)
+            marker_id += 1
+
+        if selected is not None and current_navigation is None:
             selected_marker = self.make_cube_marker(
                 marker_id,
                 "selected_frontier",
@@ -203,19 +275,27 @@ class ActiveSlamMarkerPublisher:
             marker.points.append(point)
         return marker
 
-    def make_planner_path_marker(self, marker_id: int, path: Path) -> Marker:
+    def make_planner_path_marker(
+        self,
+        marker_id: int,
+        path: Path,
+        *,
+        namespace: str = "selected_planner_path",
+        color: tuple[float, float, float, float] = (0.85, 0.2, 1.0, 1.0),
+        scale: float = 0.06,
+    ) -> Marker:
         marker = Marker()
         marker.header.frame_id = self.global_frame
-        marker.ns = "selected_planner_path"
+        marker.ns = namespace
         marker.id = marker_id
         marker.type = Marker.LINE_STRIP
         marker.action = Marker.ADD
         marker.pose.orientation.w = 1.0
-        marker.scale.x = 0.06
-        marker.color.r = 0.85
-        marker.color.g = 0.2
-        marker.color.b = 1.0
-        marker.color.a = 1.0
+        marker.scale.x = scale
+        marker.color.r = color[0]
+        marker.color.g = color[1]
+        marker.color.b = color[2]
+        marker.color.a = color[3]
         for pose in path.poses:
             point = Point()
             point.x = pose.pose.position.x

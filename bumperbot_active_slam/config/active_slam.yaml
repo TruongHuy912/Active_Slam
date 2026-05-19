@@ -20,6 +20,10 @@ active_slam_explorer:
     max_goal_search_time_sec: 15.0
     frontier_merge_radius: 0.35
     frontier_buffer_timeout_sec: 20.0
+    enable_nav2_goal_fallback: true
+    nav2_goal_search_radius: 0.6
+    nav2_goal_search_step: 0.10
+    nav2_goal_max_cost: 50
     frontier_min_cluster_size: 5
     frontier_connectivity: 8
     lambda_decay: 0.6

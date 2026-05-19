@@ -75,8 +75,11 @@ class ActiveSlamExplorer(Node):
         self.active_goal_handle = None
         self.active_goal_xy: Optional[Point2D] = None
         self.active_goal_sent_time: Optional[Time] = None
+        self.current_navigation_selection: Optional[ScoredFrontier] = None
         self.navigation_status = "idle"
         self.last_rejection_counts: dict[str, int] = {}
+        self.rejected_costmap_clusters: list[FrontierCluster] = []
+        self._last_costmap_debug_by_point: dict[Point2D, str] = {}
         self._last_goal_rejection_reason = "goal_invalid"
         self._last_planner_rejection_reason = "planner_failed"
         self._last_throttle_log: dict[str, Time] = {}
@@ -171,6 +174,9 @@ class ActiveSlamExplorer(Node):
         self.keep_selecting_markers_while_navigating = bool(
             self.declare_parameter("keep_selecting_markers_while_navigating", True).value
         )
+        self.show_preview_while_navigating = bool(
+            self.declare_parameter("show_preview_while_navigating", False).value
+        )
         self.debug_markers = bool(self.declare_parameter("debug_markers", True).value)
         self.marker_topic = self.declare_parameter("marker_topic", "/active_slam/markers").value
         self.navigate_action_name = self.declare_parameter("navigate_action_name", "navigate_to_pose").value
@@ -192,6 +198,10 @@ class ActiveSlamExplorer(Node):
         self.max_goal_search_time_sec = float(self.declare_parameter("max_goal_search_time_sec", 15.0).value)
         self.frontier_merge_radius = float(self.declare_parameter("frontier_merge_radius", 0.35).value)
         self.frontier_buffer_timeout_sec = float(self.declare_parameter("frontier_buffer_timeout_sec", 20.0).value)
+        self.enable_nav2_goal_fallback = bool(self.declare_parameter("enable_nav2_goal_fallback", True).value)
+        self.nav2_goal_search_radius = float(self.declare_parameter("nav2_goal_search_radius", 0.6).value)
+        self.nav2_goal_search_step = float(self.declare_parameter("nav2_goal_search_step", 0.10).value)
+        self.nav2_goal_max_cost = int(self.declare_parameter("nav2_goal_max_cost", 50).value)
 
         if self.algorithm_mode == "aslam_original" and self.frontier_source != "rrt":
             self.get_logger().warn("aslam_original requested with non-RRT frontier_source; this is a debug fallback, not the original detector.")
@@ -264,7 +274,10 @@ class ActiveSlamExplorer(Node):
         now = self.get_clock().now()
         self.update_navigation_state(robot_xy)
         self.state.prune(now)
+        self.clear_navigation_visuals_if_done(now)
         self.last_rejection_counts = {}
+        self.rejected_costmap_clusters = []
+        self._last_costmap_debug_by_point = {}
 
         map_msg = self.latest_map
         meta = grid_meta_from_map_info(map_msg.info)
@@ -273,7 +286,12 @@ class ActiveSlamExplorer(Node):
         if self.is_navigating():
             self.exploration_state_name = "NAVIGATING"
             self.navigation_status = "NAVIGATING"
-            self.publish_markers(raw_clusters, [], None, meta)
+            preview = None
+            preview_list: list[ScoredFrontier] = []
+            if self.show_preview_while_navigating:
+                preview_list = self.score_frontiers(map_msg, meta, robot_xy, candidate_clusters)
+                preview = max(preview_list, key=lambda item: item.utility) if preview_list else None
+            self.publish_markers(raw_clusters, preview_list, preview, meta)
             return
 
         if self.state.is_settling(now):
@@ -346,23 +364,74 @@ class ActiveSlamExplorer(Node):
         now_sec = now.nanoseconds / 1.0e9
         self.frontier_filter.add_points(raw_points, now_sec)
         buffered_raw_points = self.frontier_filter.raw_points(now_sec)
-        filtered_points, rejected = self.frontier_filter.filtered_points(
-            now_sec,
-            map_msg,
-            meta,
-            self.latest_costmap,
-            self.global_frame,
-            costmap_threshold=self.costmap_clearing_threshold,
-            allow_unknown_goal=self.allow_unknown_goal,
-            info_radius=self.info_radius,
-            information_threshold=self.information_threshold,
-        )
-        for key, value in rejected.items():
-            self.last_rejection_counts[key] = self.last_rejection_counts.get(key, 0) + value
+        clustered_points = self.frontier_filter.clustered_points(now_sec)
+        filtered_points: list[Point2D] = []
+        fallback_candidate_points: list[Point2D] = []
+        for point in clustered_points:
+            cost, reason = costmap_value_at(self.latest_costmap, self.global_frame, point)
+            cost_ok = cost is not None and is_acceptable_cost(
+                cost,
+                self.costmap_clearing_threshold,
+                self.allow_unknown_goal,
+            )
+            if not cost_ok:
+                self.record_costmap_rejection(point, cost, reason, threshold=self.costmap_clearing_threshold)
+                self.rejected_costmap_clusters.extend(clusters_from_points([point], meta))
+                info_gain_value = information_gain(map_msg, meta, point, self.info_radius)
+                if info_gain_value >= self.information_threshold and self.enable_nav2_goal_fallback:
+                    fallback_candidate_points.append(point)
+                elif info_gain_value < self.information_threshold:
+                    self.reject_candidate("low_information_gain")
+                continue
+
+            info_gain_value = information_gain(map_msg, meta, point, self.info_radius)
+            if info_gain_value < self.information_threshold:
+                self.reject_candidate("low_information_gain")
+                continue
+            filtered_points.append(point)
+
         raw_clusters = clusters_from_points(buffered_raw_points, meta)
         filtered_clusters = clusters_from_points(filtered_points, meta)
+        fallback_clusters = clusters_from_points(fallback_candidate_points, meta)
         self.publish_point_stream(raw_clusters, filtered_clusters=filtered_clusters)
-        return raw_clusters, filtered_clusters
+        return raw_clusters, filtered_clusters + fallback_clusters
+
+    def record_costmap_rejection(
+        self,
+        xy: Point2D,
+        cost: Optional[int],
+        reason: str,
+        *,
+        threshold: int,
+    ) -> None:
+        self.reject_candidate("costmap_rejected")
+        group = self.costmap_rejection_group(cost, reason, threshold=threshold)
+        self.reject_candidate(group)
+        detail = f"{group}: cost={cost if cost is not None else 'None'} xy=({xy[0]:.2f},{xy[1]:.2f}) reason={reason or 'threshold'}"
+        self._last_costmap_debug_by_point[xy] = detail
+        self.log_throttled(
+            f"costmap_reject_{group}",
+            f"Costmap rejected frontier candidate: {detail}",
+            level="info",
+            period_sec=5.0,
+        )
+        if cost is not None and cost >= threshold:
+            self.reject_candidate("costmap_above_threshold")
+
+    def costmap_rejection_group(self, cost: Optional[int], reason: str, *, threshold: int) -> str:
+        if reason == "waiting_costmap":
+            return "costmap_unavailable"
+        if reason in ("costmap_rejected", "costmap_frame_mismatch") and cost is None:
+            return "costmap_outside"
+        if cost is None:
+            return "costmap_outside"
+        if cost < 0:
+            return "costmap_unknown"
+        if cost >= 100:
+            return "costmap_lethal"
+        if cost >= threshold:
+            return "costmap_inflated"
+        return "costmap_rejected"
 
     def detect_bfs_clusters(self, map_msg: OccupancyGrid, meta: GridMeta) -> list[FrontierCluster]:
         return detect_frontier_clusters(
@@ -548,7 +617,20 @@ class ActiveSlamExplorer(Node):
         if centroid_candidate is not None:
             return centroid_candidate
 
+        centroid_rejection = self._last_goal_rejection_reason
+        if centroid_rejection == "costmap_rejected" and self.enable_nav2_goal_fallback:
+            fallback_candidate = self.find_nav2_safe_goal_near_frontier(map_msg, meta, robot_xy, robot_cell, frontier_xy)
+            if fallback_candidate is not None:
+                self.log_throttled(
+                    "nav2_safe_goal_fallback",
+                    "ROS 2/Nav2 adaptation fallback: centroid cost rejected, using nearby safe goal",
+                    level="warn",
+                    period_sec=5.0,
+                )
+                return fallback_candidate
+
         if self.frontier_goal_offset <= 0.0:
+            self._last_goal_rejection_reason = centroid_rejection
             return None
 
         if self.algorithm_mode == "aslam_original":
@@ -570,6 +652,55 @@ class ActiveSlamExplorer(Node):
         free_goal_xy = map_to_world(free_goal_cell[0], free_goal_cell[1], meta)
         return self.evaluate_goal_candidate(map_msg, meta, robot_xy, robot_cell, free_goal_xy, used_offset=True)
 
+    def find_nav2_safe_goal_near_frontier(
+        self,
+        map_msg: OccupancyGrid,
+        meta: GridMeta,
+        robot_xy: Point2D,
+        robot_cell: Cell,
+        frontier_xy: Point2D,
+    ) -> Optional[CandidateGoal]:
+        if self.nav2_goal_search_radius <= 0.0 or self.nav2_goal_search_step <= 0.0:
+            return None
+
+        candidates = self.nearby_goal_points(frontier_xy, self.nav2_goal_search_radius, self.nav2_goal_search_step)
+        last_reason = self._last_goal_rejection_reason
+        for goal_xy in candidates:
+            cost, reason = costmap_value_at(self.latest_costmap, self.global_frame, goal_xy)
+            if cost is None or cost < 0 or cost >= self.nav2_goal_max_cost:
+                self.record_costmap_rejection(goal_xy, cost, reason, threshold=self.nav2_goal_max_cost)
+                continue
+            candidate = self.evaluate_goal_candidate(
+                map_msg,
+                meta,
+                robot_xy,
+                robot_cell,
+                goal_xy,
+                used_offset=True,
+                cost_threshold=self.nav2_goal_max_cost,
+                record_costmap_rejection=False,
+            )
+            if candidate is not None:
+                return candidate
+            last_reason = self._last_goal_rejection_reason
+        self._last_goal_rejection_reason = last_reason or "no_nav2_safe_goal"
+        return None
+
+    def nearby_goal_points(self, center: Point2D, radius: float, step: float) -> list[Point2D]:
+        points: list[Point2D] = []
+        max_ring = max(0, int(math.ceil(radius / step)))
+        for ring in range(1, max_ring + 1):
+            ring_radius = min(radius, ring * step)
+            samples = max(8, int(math.ceil(2.0 * math.pi * ring_radius / step)))
+            for index in range(samples):
+                theta = 2.0 * math.pi * float(index) / float(samples)
+                points.append((
+                    center[0] + ring_radius * math.cos(theta),
+                    center[1] + ring_radius * math.sin(theta),
+                ))
+        points.sort(key=lambda point: euclidean_distance(center, point))
+        return points
+
     def evaluate_goal_candidate(
         self,
         map_msg: OccupancyGrid,
@@ -579,12 +710,15 @@ class ActiveSlamExplorer(Node):
         goal_xy: Point2D,
         *,
         used_offset: bool,
+        cost_threshold: Optional[int] = None,
+        record_costmap_rejection: bool = True,
     ) -> Optional[CandidateGoal]:
         goal_cell = world_to_map(goal_xy[0], goal_xy[1], meta)
         if goal_cell is None:
             self._last_goal_rejection_reason = "off_map_goal"
             return None
 
+        threshold = self.costmap_clearing_threshold if cost_threshold is None else cost_threshold
         cost, reason = costmap_value_at(self.latest_costmap, self.global_frame, goal_xy)
         if reason == "waiting_costmap":
             self.log_throttled(
@@ -598,8 +732,10 @@ class ActiveSlamExplorer(Node):
                 f"Global costmap frame '{self.latest_costmap.header.frame_id}' differs from global_frame '{self.global_frame}'.",
                 level="warn",
             )
-        if cost is None or not is_acceptable_cost(cost, self.costmap_clearing_threshold, self.allow_unknown_goal):
+        if cost is None or not is_acceptable_cost(cost, threshold, self.allow_unknown_goal):
             self._last_goal_rejection_reason = "costmap_rejected"
+            if record_costmap_rejection:
+                self.record_costmap_rejection(goal_xy, cost, reason, threshold=threshold)
             return None
 
         planner_path = self.compute_nav2_path(robot_xy, goal_xy)
@@ -613,7 +749,7 @@ class ActiveSlamExplorer(Node):
             planner_path,
             self.latest_costmap,
             self.global_frame,
-            self.costmap_clearing_threshold,
+            threshold,
             self.allow_unknown_goal,
         ):
             self._last_goal_rejection_reason = "path_blocked_costmap"
@@ -689,6 +825,9 @@ class ActiveSlamExplorer(Node):
             visited_goals=self.state.visited_goals,
             active_goal_xy=self.active_goal_xy,
             navigation_status=self.navigation_status,
+            rejected_costmap_clusters=self.rejected_costmap_clusters,
+            current_navigation=self.current_navigation_selection,
+            preview_selected=selected if self.show_preview_while_navigating and self.is_navigating() else None,
         )
 
     def maybe_send_navigation_goal(self, selected: ScoredFrontier, robot_xy: Point2D) -> None:
@@ -736,6 +875,7 @@ class ActiveSlamExplorer(Node):
         self.last_goal_send_time = now
         self.active_goal_xy = selected.nav_goal_xy
         self.active_goal_sent_time = now
+        self.current_navigation_selection = selected
         self.state.goal_retries[selected.nav_goal_cell] = retry_count + 1
         self.get_logger().info(
             f"Sending NavigateToPose goal to ({selected.nav_goal_xy[0]:.2f}, {selected.nav_goal_xy[1]:.2f}) "
@@ -758,6 +898,7 @@ class ActiveSlamExplorer(Node):
             self.active_goal_handle = None
             self.active_goal_xy = None
             self.active_goal_sent_time = None
+            self.current_navigation_selection = None
             now = self.get_clock().now()
             self.state.add_to_blacklist(now, selected.nav_goal_xy, timeout_sec=self.rejected_blacklist_timeout_sec)
             self.state.add_to_blacklist(now, selected.cluster.centroid, timeout_sec=self.rejected_blacklist_timeout_sec)
@@ -793,6 +934,7 @@ class ActiveSlamExplorer(Node):
             f"NavigateToPose finished with {goal_status_name(status)} at "
             f"({selected.nav_goal_xy[0]:.2f}, {selected.nav_goal_xy[1]:.2f}); temporarily blacklisting this candidate."
         )
+        self.current_navigation_selection = None
         self.state.add_to_blacklist(now, selected.nav_goal_xy, timeout_sec=self.blacklist_timeout_sec)
         self.state.add_to_blacklist(now, selected.cluster.centroid, timeout_sec=self.blacklist_timeout_sec)
 
@@ -817,6 +959,16 @@ class ActiveSlamExplorer(Node):
             self.active_goal_handle = None
             self.active_goal_xy = None
             self.active_goal_sent_time = None
+            self.current_navigation_selection = None
+
+    def clear_navigation_visuals_if_done(self, now: Time) -> None:
+        if self.current_navigation_selection is None:
+            return
+        if self.is_navigating():
+            return
+        if self.state.is_settling(now):
+            return
+        self.current_navigation_selection = None
 
     def is_navigating(self) -> bool:
         return self.active_goal_xy is not None or self.active_goal_handle is not None
